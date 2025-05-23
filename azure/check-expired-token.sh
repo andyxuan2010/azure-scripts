@@ -41,7 +41,7 @@ for row in $(echo "${app_ids}" | jq -r '.[] | @base64'); do
     app_id=$(_jq '.appId')
     app_name=$(_jq '.name')
     counter=$((counter + 1))
-    echo -ne "Processing app $app_name [$counter/$total_apps]\r"
+    echo -ne "Processing app $app_name [$counter/$total_apps]\r\n"
 
     secrets=$(az ad app credential list --id "$app_id" -o json)
 
