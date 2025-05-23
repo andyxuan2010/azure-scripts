@@ -6,6 +6,8 @@ OUTPUT_FORMAT=$2
 
 NOW=$(date -u +%s)
 
+echo ${CUTOFF}
+
 if [[ $DAYS_THRESHOLD -ge 0 ]]; then
     MODE="future"
     CUTOFF=$(date -u -d "+$DAYS_THRESHOLD days" +%s)
@@ -26,8 +28,10 @@ else
 fi
 
 # Get all App Registrations
-app_ids=$(az ad app list --query "[].{appId:appId, name:displayName}" -o json)
-
+app_ids=$(az ad app list --all --query "[].{appId:appId, name:displayName}" -o json)
+# Count and print total number of app_ids
+total_apps=$(echo "$app_ids" | jq 'length')
+echo "Total App Registrations found: $total_apps"
 for row in $(echo "${app_ids}" | jq -r '.[] | @base64'); do
     _jq() {
         echo "${row}" | base64 --decode | jq -r "${1}"
@@ -36,7 +40,7 @@ for row in $(echo "${app_ids}" | jq -r '.[] | @base64'); do
     app_id=$(_jq '.appId')
     app_name=$(_jq '.name')
 
-    secrets=$(az ad app credential list --id "$app_id" --query "[].{endDateTime:endDateTime}" -o json)
+    secrets=$(az ad app credential list --id "$app_id" -o json)
 
     for sec in $(echo "${secrets}" | jq -r '.[] | @base64'); do
         end_date=$(echo "${sec}" | base64 --decode | jq -r '.endDateTime')
