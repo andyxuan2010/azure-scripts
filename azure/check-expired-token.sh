@@ -31,6 +31,7 @@ fi
 app_ids=$(az ad app list --all --query "[].{appId:appId, name:displayName}" -o json)
 # Count and print total number of app_ids
 total_apps=$(echo "$app_ids" | jq 'length')
+counter=0
 echo "Total App Registrations found: $total_apps"
 for row in $(echo "${app_ids}" | jq -r '.[] | @base64'); do
     _jq() {
@@ -39,6 +40,8 @@ for row in $(echo "${app_ids}" | jq -r '.[] | @base64'); do
 
     app_id=$(_jq '.appId')
     app_name=$(_jq '.name')
+    counter=$((counter + 1))
+    echo -ne "Processing app $app_name [$counter/$total_apps]\r"
 
     secrets=$(az ad app credential list --id "$app_id" -o json)
 
