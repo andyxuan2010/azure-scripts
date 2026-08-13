@@ -1,132 +1,129 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=aro-lib.sh
+source "$SCRIPT_DIR/aro-lib.sh"
 
-# Make sure you also download machineset-template.yaml and have it in the same directory this script is executed in.
+usage() {
+    cat <<'USAGE'
+Usage: aro4-createmachineset.sh --name MACHINESET --zone 1|2|3
+                                --replicas COUNT --vm-size SKU
+                                [--template FILE] [--output FILE] [--apply]
 
-# exit when any command fails
-set -e
+Builds a machine-set manifest from an existing ARO machine set. Without
+--apply, the generated manifest is validated but not submitted.
+USAGE
+}
 
-# Begin
-echo " "
-echo "Adding machineset to Azure Red Hat OpenShift"
-echo "--------------------------------------------"
-echo "You must be logged in to your Azure Red Hat OpenShift cluster (oc) as a cluster-admin and into the Azure Linux CLI (az) in the subscription of your ARO cluster"
-echo " "
+TEMPLATE=machineset-template.yaml
+OUTPUT=
+MACHINESET=
+ZONE=
+REPLICAS=
+VM_SIZE=
+APPLY=0
 
-if [ ! -f "machineset-template.yaml" ]; then
-    echo "Please also obtain the machine-template.yaml file and place it in the same directory in which you are invoking this script."
-    exit 1
+while (($#)); do
+    case $1 in
+        --template) TEMPLATE=${2:?Missing value for --template}; shift 2 ;;
+        --output) OUTPUT=${2:?Missing value for --output}; shift 2 ;;
+        --name) MACHINESET=${2:?Missing value for --name}; shift 2 ;;
+        --zone) ZONE=${2:?Missing value for --zone}; shift 2 ;;
+        --replicas) REPLICAS=${2:?Missing value for --replicas}; shift 2 ;;
+        --vm-size) VM_SIZE=${2:?Missing value for --vm-size}; shift 2 ;;
+        --apply) APPLY=1; shift ;;
+        --help|-h) usage; exit 0 ;;
+        *) usage >&2; aro_die "Unknown argument: $1" ;;
+    esac
+done
+
+[[ -n "$MACHINESET" && -n "$ZONE" && -n "$REPLICAS" && -n "$VM_SIZE" ]] ||
+    { usage >&2; aro_die "Name, zone, replicas, and VM size are required."; }
+[[ "$MACHINESET" =~ ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$ ]] ||
+    aro_die "Invalid machine-set name: $MACHINESET"
+[[ "$ZONE" =~ ^[123]$ ]] || aro_die "Zone must be 1, 2, or 3."
+[[ "$REPLICAS" =~ ^[0-9]+$ ]] || aro_die "Replicas must be a non-negative integer."
+[[ "$VM_SIZE" =~ ^[A-Za-z0-9._-]+$ ]] || aro_die "Invalid Azure VM SKU: $VM_SIZE"
+[[ -n "$OUTPUT" ]] || OUTPUT="$MACHINESET-template.yaml"
+
+trap 'rc=$?; aro_log ERROR "Command failed at line $LINENO (exit $rc)"; exit "$rc"' ERR
+aro_require_azure_login
+aro_require_oc_login
+aro_require_cmd jq
+aro_require_file "$TEMPLATE"
+
+BASE_MACHINESET="$(oc get machineset -n openshift-machine-api \
+    -o jsonpath='{.items[0].metadata.name}')"
+[[ -n "$BASE_MACHINESET" ]] ||
+    aro_die "No existing machine set was found in openshift-machine-api."
+
+get_field() {
+    oc get machineset "$BASE_MACHINESET" -n openshift-machine-api \
+        -o "jsonpath=$1"
+}
+
+AZURE_REGION="$(get_field '{.spec.template.spec.providerSpec.value.location}')"
+ARO_SKU="$(get_field '{.spec.template.spec.providerSpec.value.image.sku}')"
+ARO_SKU_VERSION="$(get_field '{.spec.template.spec.providerSpec.value.image.version}')"
+CLUSTER_NAME="$(get_field '{.metadata.labels.machine\.openshift\.io/cluster-api-cluster}')"
+NETWORK_RG="$(get_field '{.spec.template.spec.providerSpec.value.networkResourceGroup}')"
+CLUSTER_RG="$(get_field '{.spec.template.spec.providerSpec.value.resourceGroup}')"
+PUBLIC_LB="$(get_field '{.spec.template.spec.providerSpec.value.publicLoadBalancer}')"
+SUBNET="$(get_field '{.spec.template.spec.providerSpec.value.subnet}')"
+VNET_NAME="$(get_field '{.spec.template.spec.providerSpec.value.vnet}')"
+
+[[ -n "$AZURE_REGION" && -n "$ARO_SKU" && -n "$ARO_SKU_VERSION" &&
+   -n "$CLUSTER_NAME" && -n "$NETWORK_RG" && -n "$CLUSTER_RG" &&
+   -n "$PUBLIC_LB" && -n "$SUBNET" && -n "$VNET_NAME" ]] ||
+    aro_die "The existing machine set did not contain all required Azure fields."
+
+VM_JSON="$(az vm list-sizes --location "$AZURE_REGION" \
+    --query "[?name=='$VM_SIZE'] | [0]" -o json --only-show-errors)"
+MEMORY_MB="$(jq -r '.memoryInMb // empty' <<< "$VM_JSON")"
+VCPU_CORES="$(jq -r '.numberOfCores // empty' <<< "$VM_JSON")"
+[[ -n "$MEMORY_MB" && -n "$VCPU_CORES" ]] ||
+    aro_die "VM size '$VM_SIZE' is not available in Azure region '$AZURE_REGION'."
+
+cp -- "$TEMPLATE" "$OUTPUT"
+escape_sed() {
+    printf '%s' "$1" | sed 's/[\\&|]/\\&/g'
+}
+replace_placeholder() {
+    local placeholder=$1
+    local value
+    value="$(escape_sed "$2")"
+    sed -i "s|$placeholder|$value|g" "$OUTPUT"
+}
+
+replace_placeholder MEMORYMB "$MEMORY_MB"
+replace_placeholder VCPUCORES "$VCPU_CORES"
+replace_placeholder CLUSTERNAME "$CLUSTER_NAME"
+replace_placeholder MACHINESETNAME "$MACHINESET"
+replace_placeholder NETWORKRG "$NETWORK_RG"
+replace_placeholder PUBLICLBNAME "$PUBLIC_LB"
+replace_placeholder VNETNAME "$VNET_NAME"
+replace_placeholder WHICHAZ "$ZONE"
+replace_placeholder PROTECTEDRG "$CLUSTER_RG"
+replace_placeholder AZUREDC "$AZURE_REGION"
+replace_placeholder VMSKU "$VM_SIZE"
+replace_placeholder AROSKUVERSION "$ARO_SKU_VERSION"
+replace_placeholder AROSKU "$ARO_SKU"
+replace_placeholder SUBNET "$SUBNET"
+replace_placeholder NUMREPLICAS "$REPLICAS"
+
+if grep -Eq 'MEMORYMB|VCPUCORES|CLUSTERNAME|MACHINESETNAME|NETWORKRG|PUBLICLBNAME|VNETNAME|WHICHAZ|PROTECTEDRG|AZUREDC|VMSKU|AROSKUVERSION|AROSKU|SUBNET|NUMREPLICAS' "$OUTPUT"; then
+    aro_die "Unresolved template placeholders remain in $OUTPUT."
 fi
 
-echo -n "Determining the name of an existing machineset..."
-CURRENTMACHINESET="$(oc get machineset -n openshift-machine-api -o jsonpath='{.items[0].metadata.name}')"
-echo "Done."
+oc apply --dry-run=server --filename "$OUTPUT" >/dev/null
+aro_log INFO "Generated and validated $OUTPUT."
 
-echo -n "Obtaining required variables..."
-echo -n "azure region, "
-AZUREDC="$(oc get machineset $CURRENTMACHINESET -n openshift-machine-api -o jsonpath='{.spec.template.spec.providerSpec.value.location}')"
-echo -n "marketplace sku, "
-AROSKU="$(oc get machineset $CURRENTMACHINESET -n openshift-machine-api -o jsonpath='{.spec.template.spec.providerSpec.value.image.sku}')"
-echo -n "marketplace version, "
-AROSKUVERSION="$(oc get machineset $CURRENTMACHINESET -n openshift-machine-api -o jsonpath='{.spec.template.spec.providerSpec.value.image.version}')"
-echo -n "cluster name, "
-CLUSTERNAME="$(oc get machineset $CURRENTMACHINESET -n openshift-machine-api -o jsonpath='{.metadata.labels.machine\.openshift\.io/cluster-api-cluster}')"
-echo -n "network rg, "
-NETWORKRG="$(oc get machineset $CURRENTMACHINESET -n openshift-machine-api -o jsonpath='{.spec.template.spec.providerSpec.value.networkResourceGroup}')"
-echo -n "cluster rg, "
-PROTECTEDRG="$(oc get machineset $CURRENTMACHINESET -n openshift-machine-api -o jsonpath='{.spec.template.spec.providerSpec.value.resourceGroup}')"
-echo -n "lb name, "
-PUBLICLBNAME="$(oc get machineset $CURRENTMACHINESET -n openshift-machine-api -o jsonpath='{.spec.template.spec.providerSpec.value.publicLoadBalancer}')"
-echo -n "worker subnet, "
-SUBNET="$(oc get machineset $CURRENTMACHINESET -n openshift-machine-api -o jsonpath='{.spec.template.spec.providerSpec.value.subnet}')"
-echo -n "vnet name "
-VNETNAME="$(oc get machineset $CURRENTMACHINESET -n openshift-machine-api -o jsonpath='{.spec.template.spec.providerSpec.value.vnet}')"
-echo "Done."
-
-echo " "
-echo "Your existing machinesets:"
-echo " "
-oc get machineset -n openshift-machine-api -o wide
-
-echo " "
-echo "#########################################################################################################################################"
-echo " "
-
-echo -n "Enter the name of the machineset you wish to create (some format of what you see above):  > "
-read MACHINESETNAME
-echo -n "Enter the Azure Availability Zone this machineset should create nodes in (1, 2 or 3):  > "
-read WHICHAZ
-echo -n "Enter the number of worker nodes that should be created for this machineset: > "
-read NUMREPLICAS
-
-echo -n "Making a copy of the existing machineset template..."
-cp machineset-template.yaml $MACHINESETNAME-template.yaml
-echo "Done."
-
-echo " "
-echo "#########################################################################################################################################"
-echo " "
-echo "---------------------------------------------------------------------------------------------------------------------------------------------------------------"
-echo "- PLEASE REFERENCE THE LIST OF SUPPORTED ARO VM SKUs AT: https://docs.microsoft.com/en-us/azure/openshift/support-policies-v4#supported-virtual-machine-sizes -"
-echo "---------------------------------------------------------------------------------------------------------------------------------------------------------------"
-echo " "
-echo "Keep in mind that not all VM SKUs are avaialble in all Azure regions"
-echo -n "Enter the Azure VM SKU you wish to use for this machineset (ex: Standard_E4s_v3):  > "
-read VMSKU
-echo " "
-
-if [ -z "$(az vm list-sizes -l $AZUREDC -o tsv |grep $VMSKU)" ]; then
-	echo "You entered an invalid Azure VM SKU. Please try again."
-	exit 1
+if ((APPLY)); then
+    oc apply --server-side --field-manager=aro-scripts --filename "$OUTPUT"
+    aro_log INFO "Machine set '$MACHINESET' applied."
+else
+    aro_log INFO "No cluster change was made. Re-run with --apply to submit the manifest."
 fi
-
-echo -n "Making a copy of the existing machineset template..."
-cp machineset-template.yaml $MACHINESETNAME-template.yaml
-echo "Done."
-
-MEMORYMB="$(az vm list-sizes -l $AZUREDC -o tsv |grep $VMSKU | awk '{print $2}')"
-VCPUCORES="$(az vm list-sizes -l $AZUREDC -o tsv |grep $VMSKU | awk '{print $4}')"
-
-echo -n "Performing variable substitutions..."
-echo -n "memory, "
-sed -i'' -e "s/MEMORYMB/$MEMORYMB/g" $MACHINESETNAME-template.yaml
-echo -n "cores, "
-sed -i'' -e "s/VCPUCORES/$VCPUCORES/g" $MACHINESETNAME-template.yaml
-echo -n "cluster name, "
-sed -i'' -e "s/CLUSTERNAME/$CLUSTERNAME/g" $MACHINESETNAME-template.yaml
-echo -n "machineset name, "
-sed -i'' -e "s/MACHINESETNAME/$MACHINESETNAME/g" $MACHINESETNAME-template.yaml
-echo -n "network rg, "
-sed -i'' -e "s/NETWORKRG/$NETWORKRG/g" $MACHINESETNAME-template.yaml
-echo -n "lb name, "
-sed -i'' -e "s/PUBLICLBNAME/$PUBLICLBNAME/g" $MACHINESETNAME-template.yaml
-echo -n "vnet name, "
-sed -i'' -e "s/VNETNAME/$VNETNAME/g" $MACHINESETNAME-template.yaml
-echo -n "availability zone, "
-sed -i'' -e "s/WHICHAZ/$WHICHAZ/g" $MACHINESETNAME-template.yaml
-echo -n "cluster rg, "
-sed -i'' -e "s/PROTECTEDRG/$PROTECTEDRG/g" $MACHINESETNAME-template.yaml
-echo -n "azure region, "
-sed -i'' -e "s/AZUREDC/$AZUREDC/g" $MACHINESETNAME-template.yaml
-echo -n "vm sku, "
-sed -i'' -e "s/VMSKU/$VMSKU/g" $MACHINESETNAME-template.yaml
-echo -n "marketplace version, "
-sed -i'' -e "s/AROSKUVERSION/$AROSKUVERSION/g" $MACHINESETNAME-template.yaml
-echo -n "marketplace sku, "
-sed -i'' -e "s/AROSKU/$AROSKU/g" $MACHINESETNAME-template.yaml
-echo -n "worker subnet, "
-sed -i'' -e "s/SUBNET/$SUBNET/g" $MACHINESETNAME-template.yaml
-echo -n "replicas, "
-sed -i'' -e "s/NUMREPLICAS/$NUMREPLICAS/g" $MACHINESETNAME-template.yaml
-echo "Done."
-echo " "
-
-echo -n "Adding new machineset to Azure Red Hat OpenShift cluster $CLUSTERNAME..."
-oc apply -f $MACHINESETNAME-template.yaml
-echo " "
-echo "Script complete."
-echo " "
-
-rm -f $MACHINESETNAME-template.yaml
-
-exit 0

@@ -1,218 +1,115 @@
 @echo off
-SETLOCAL EnableDelayedExpansion
+setlocal EnableExtensions DisableDelayedExpansion
 
-REM Specify the path to your .credentials file
-set "credentialsFile=.credentials"
-REM Check if the .credentials file exists
-if not exist "%credentialsFile%" (
-    echo Error: .credentials file not found.
+if "%~1"=="" (
+    echo Usage: createaro.bat dev^|prd [pull-secret-file]
+    exit /b 2
+)
+if /I not "%~1"=="dev" if /I not "%~1"=="prd" (
+    echo Error: environment must be dev or prd.
+    exit /b 2
+)
+
+where az >nul 2>&1
+if errorlevel 1 (
+    echo Error: Azure CLI was not found.
     exit /b 1
 )
-REM Set the Azure subscription based on the input parameter
-set username=
-set password=
-set tenantid=
-set subscriptionid=
-set subscription=
-set cluster-resource-group=
+call az account show --only-show-errors >nul 2>&1
+if errorlevel 1 (
+    echo Error: authenticate with Azure CLI before running this script.
+    exit /b 1
+)
 
-REM Read credentials from file
-if "%1"=="dev" (
-    for /f "tokens=1,* delims==" %%a in (%credentialsFile%) do (
-        if "%%a"=="dev-username" set "username=%%b"
-        if "%%a"=="dev-password" set "password=%%b"
-        if "%%a"=="dev-tenantid" set "tenantid=%%b"
-        if "%%a"=="dev-subscriptionid" set "subscriptionid=%%b"
-        if "%%a"=="dev-subscription" set "subscription=%%b"
-        if "%%a"=="dev-account" set "account=%%b"
+set "ENVIRONMENT=%~1"
+set "PULL_SECRET_FILE=%~2"
+if not defined PULL_SECRET_FILE set "PULL_SECRET_FILE=pull-secret.txt"
+if not exist "%PULL_SECRET_FILE%" (
+    echo Error: pull-secret file not found: "%PULL_SECRET_FILE%"
+    exit /b 1
+)
+
+if /I "%ENVIRONMENT%"=="dev" (
+    set "SUBSCRIPTION=%ARO_DEV_SUBSCRIPTION%"
+    set "RESOURCE_GROUP=%ARO_DEV_RESOURCE_GROUP%"
+    set "CLUSTER_RESOURCE_GROUP=%ARO_DEV_CLUSTER_RESOURCE_GROUP%"
+    set "VNET_RESOURCE_GROUP=%ARO_DEV_VNET_RESOURCE_GROUP%"
+    set "VNET_NAME=%ARO_DEV_VNET_NAME%"
+    set "MASTER_SUBNET=%ARO_DEV_MASTER_SUBNET%"
+    set "WORKER_SUBNET=%ARO_DEV_WORKER_SUBNET%"
+    set "ARO_NAME=%ARO_DEV_CLUSTER_NAME%"
+    set "ARO_DOMAIN=%ARO_DEV_DOMAIN%"
+    set "MASTER_PREFIX=%ARO_DEV_MASTER_PREFIX%"
+    set "WORKER_PREFIX=%ARO_DEV_WORKER_PREFIX%"
+) else (
+    set "SUBSCRIPTION=%ARO_PRD_SUBSCRIPTION%"
+    set "RESOURCE_GROUP=%ARO_PRD_RESOURCE_GROUP%"
+    set "CLUSTER_RESOURCE_GROUP=%ARO_PRD_CLUSTER_RESOURCE_GROUP%"
+    set "VNET_RESOURCE_GROUP=%ARO_PRD_VNET_RESOURCE_GROUP%"
+    set "VNET_NAME=%ARO_PRD_VNET_NAME%"
+    set "MASTER_SUBNET=%ARO_PRD_MASTER_SUBNET%"
+    set "WORKER_SUBNET=%ARO_PRD_WORKER_SUBNET%"
+    set "ARO_NAME=%ARO_PRD_CLUSTER_NAME%"
+    set "ARO_DOMAIN=%ARO_PRD_DOMAIN%"
+    set "MASTER_PREFIX=%ARO_PRD_MASTER_PREFIX%"
+    set "WORKER_PREFIX=%ARO_PRD_WORKER_PREFIX%"
+)
+
+for %%V in (SUBSCRIPTION RESOURCE_GROUP CLUSTER_RESOURCE_GROUP VNET_RESOURCE_GROUP VNET_NAME MASTER_SUBNET WORKER_SUBNET ARO_NAME ARO_DOMAIN MASTER_PREFIX WORKER_PREFIX) do (
+    if not defined %%V (
+        echo Error: configure all ARO_ environment variables for %ENVIRONMENT% before running this script.
+        exit /b 2
     )
-) else (
-    for /f "tokens=1,* delims==" %%a in (%credentialsFile%) do (
-        if "%%a"=="prd-username" set "username=%%b"
-        if "%%a"=="prd-password" set "password=%%b"
-        if "%%a"=="prd-tenantid" set "tenantid=%%b"
-        if "%%a"=="prd-subscriptionid" set "subscriptionid=%%b"
-        if "%%a"=="prd-subscription" set "subscription=%%b"
-        if "%%a"=="prd-account" set "account=%%b"
-    )    
 )
 
-
-
-REM az login
-echo az login --service-principal --username %username% --password=%password% --tenant %tenantid% 2>null
-call az login --service-principal --username %username% --password=%password% --tenant %tenantid% 2>null
-if %errorlevel% neq 0 (
-    echo Error: Failed to do az login with the service principal.
-    exit /b %errorlevel%
-)
-
-
-REM Set the Azure subscription
-rem echo az account set --subscription %subscription%
-call az account set --subscription %subscription%
-if %errorlevel% neq 0 (
-    echo Error: Failed to set the Azure subscription.
-    exit /b %errorlevel%
-)
-
-REM Set the resource group name and network-related values based on the input parameter
-set resource-group=
-set vnet-resource-group=
-set vnet-name=
-set master-subnet=
-set worker-subnet=
-set aro-instance-name=
-set address-prefix-master=
-set address-prefix-worker=
-set domain-name=
-set env=%1
-if "%1"=="dev" (
-    set resource-group=rg-cp4d-cc-dev
-    set cluster-resource-group=rg-cp4daro-cc-dev
-    set vnet-resource-group=rg-ba-cc-nonprod-app-network
-    set vnet-name=vnet-ba-cc-nonprod-app
-    set master-subnet=snet-cp4d-master-cc-dev
-    set worker-subnet=snet-cp4d-worker-cc-dev
-    set aro-instance-name=cp4ddev
-    set address-prefix-master=10.67.89.0/26
-    set address-prefix-worker=10.67.89.64/26
-    set domain-name=dev.example.com
-) else if "%1"=="prd" (
-    set resource-group=rg-cp4d-cc-prd
-    set cluster-resource-group=rg-cp4daro-cc-prd        
-    set vnet-resource-group=rg-ba-cc-prod-app-network
-    set vnet-name=vnet-ba-cc-prod-app
-    set master-subnet=snet-cp4d-master-cc-prd
-    set worker-subnet=snet-cp4d-worker-cc-prd
-    set aro-instance-name=cp4dprd
-    set address-prefix-master=10.67.79.0/26
-    set address-prefix-worker=10.67.79.64/26
-    set domain-name=ca.example.com
-) else (
-    echo Error: Invalid input parameter. Please specify either "dev" or "prd".
+call az account set --subscription "%SUBSCRIPTION%" --only-show-errors
+if errorlevel 1 (
+    echo Error: unable to select the configured subscription.
     exit /b 1
 )
 
+for %%P in (Microsoft.RedHatOpenShift Microsoft.Compute Microsoft.Storage Microsoft.Authorization Microsoft.Network) do (
+    echo Ensuring resource provider %%P is registered...
+    call az provider register --namespace %%P --wait --only-show-errors
+    if errorlevel 1 exit /b 1
+)
 
-REM create the resource group
-rem echo az group show --name %resource-group%
-call az group show --name %resource-group% 2>null
-if %errorlevel% equ 3 (
-	call az group create --name %resource-group% --location canadacentral  --tags "Application Name"="Cloud Pak for Data (CP4D)" "Application Owner"="Bassem Dabboubi" "AppSupport Team"="example.com" "Business Owner"="Patrick Tessier" "Environment"=%env% "Infra Availability Classification"="Bronze" "InfraSupport Team"="example.com" "Project Name"="Data Governance Foundation - Tool Setup" "Project Number"="61238"  "RPO-RTO"="72h/24h" "Run Cost (Approved Run Budget)-USD"="636.6 K" 2>null
-	if !errorlevel! neq 0 (
-	    echo Error: Failed to create the resource group %resource-group%.
-        exit /b !errorlevel!
-	)
-) else if !errorlevel! equ 1 (
-    echo WARNING:the account does not have read permission! but we will try to create the rest resource, assuming this can be done outside of the script!
+call az group create --name "%RESOURCE_GROUP%" --location canadacentral --only-show-errors -o none
+if errorlevel 1 exit /b 1
+
+call az network vnet subnet show --resource-group "%VNET_RESOURCE_GROUP%" --vnet-name "%VNET_NAME%" --name "%MASTER_SUBNET%" --only-show-errors -o none >nul 2>&1
+if errorlevel 1 (
+    call az network vnet subnet create --resource-group "%VNET_RESOURCE_GROUP%" --vnet-name "%VNET_NAME%" --name "%MASTER_SUBNET%" --address-prefixes "%MASTER_PREFIX%" --service-endpoints Microsoft.ContainerRegistry --only-show-errors -o none
+    if errorlevel 1 exit /b 1
 ) else (
-	echo INFO:the resource resource group %resource-group% already exists! It's better to start from clean!
-    rem exit /b !errorlevel!
+    echo Reusing master subnet "%MASTER_SUBNET%".
 )
 
-REM Create the subnet for %master-subnet%
-rem echo az network vnet subnet show -g %vnet-resource-group% --vnet-name %vnet-name% --name %master-subnet%
-call az network vnet subnet show -g %vnet-resource-group% --vnet-name %vnet-name% --name %master-subnet% 2>null
-if !errorlevel! equ 3 (
-	echo az network vnet subnet create -g %vnet-resource-group% --vnet-name %vnet-name% --name %master-subnet% --address-prefix %address-prefix-master%
-	call az network vnet subnet create -g %vnet-resource-group% --vnet-name %vnet-name% --name %master-subnet% --address-prefix %address-prefix-master%
-	if !errorlevel! neq 0 (
-	    echo Error: Failed to create the subnet for %master-subnet%. 
-        exit /b !errorlevel!
-	) 
-) else if !errorlevel! equ 1 (
-    echo WARNING:the account does not have read permission! but we will try to create the resource.
-	echo az network vnet subnet create -g %vnet-resource-group% --vnet-name %vnet-name% --name %master-subnet% --address-prefix %address-prefix-master%
-	call az network vnet subnet create -g %vnet-resource-group% --vnet-name %vnet-name% --name %master-subnet% --address-prefix %address-prefix-master%
-	if !errorlevel! neq 0 (
-	    echo Error: Failed to create the subnet for %master-subnet%. 
-        exit /b !errorlevel!
-	)    
+call az network vnet subnet show --resource-group "%VNET_RESOURCE_GROUP%" --vnet-name "%VNET_NAME%" --name "%WORKER_SUBNET%" --only-show-errors -o none >nul 2>&1
+if errorlevel 1 (
+    call az network vnet subnet create --resource-group "%VNET_RESOURCE_GROUP%" --vnet-name "%VNET_NAME%" --name "%WORKER_SUBNET%" --address-prefixes "%WORKER_PREFIX%" --service-endpoints Microsoft.ContainerRegistry --only-show-errors -o none
+    if errorlevel 1 exit /b 1
 ) else (
-	echo INFO:the resource subnet for %master-subnet% already exists! It's better to start from clean!
-    exit /b %errorlevel%
+    echo Reusing worker subnet "%WORKER_SUBNET%".
 )
 
-REM Create the subnet for %worker-subnet%
-rem echo az network vnet subnet show -g %vnet-resource-group% --vnet-name %vnet-name% --name %worker-subnet%
-call az network vnet subnet show -g %vnet-resource-group% --vnet-name %vnet-name% --name %worker-subnet% 2>null
-if !errorlevel! equ 3 (
-    echo az network vnet subnet create -g %vnet-resource-group% --vnet-name %vnet-name% --name %worker-subnet% --address-prefix %address-prefix-worker%
-	call az network vnet subnet create -g %vnet-resource-group% --vnet-name %vnet-name% --name %worker-subnet% --address-prefix %address-prefix-worker%
-	if !errorlevel! neq 0 (
-	    echo Error: Failed to create the subnet for %worker-subnet%. 
-        exit /b !errorlevel!
-	)
-) else if !errorlevel! equ 1 (
-    echo WARNING:the account does not have read permission! but we will try to create the resource.
-    echo az network vnet subnet create -g %vnet-resource-group% --vnet-name %vnet-name% --name %worker-subnet% --address-prefix %address-prefix-worker%
-	call az network vnet subnet create -g %vnet-resource-group% --vnet-name %vnet-name% --name %worker-subnet% --address-prefix %address-prefix-worker%
-	if !errorlevel! neq 0 (
-	    echo Error: Failed to create the subnet for %worker-subnet%. 
-        exit /b !errorlevel!
-	)    
+call az network vnet subnet update --resource-group "%VNET_RESOURCE_GROUP%" --vnet-name "%VNET_NAME%" --name "%MASTER_SUBNET%" --disable-private-link-service-network-policies true --only-show-errors -o none
+if errorlevel 1 exit /b 1
+
+call az aro show --name "%ARO_NAME%" --resource-group "%RESOURCE_GROUP%" --only-show-errors -o none >nul 2>&1
+if errorlevel 1 (
+    echo Validating ARO creation parameters...
+    call az aro validate --resource-group "%RESOURCE_GROUP%" --name "%ARO_NAME%" --cluster-resource-group "%CLUSTER_RESOURCE_GROUP%" --vnet "%VNET_NAME%" --vnet-resource-group "%VNET_RESOURCE_GROUP%" --master-subnet "%MASTER_SUBNET%" --worker-subnet "%WORKER_SUBNET%" --apiserver-visibility Private --ingress-visibility Private --only-show-errors
+    if errorlevel 1 exit /b 1
+
+    echo Creating ARO cluster "%ARO_NAME%"...
+    call az aro create --resource-group "%RESOURCE_GROUP%" --name "%ARO_NAME%" --cluster-resource-group "%CLUSTER_RESOURCE_GROUP%" --vnet "%VNET_NAME%" --vnet-resource-group "%VNET_RESOURCE_GROUP%" --master-subnet "%MASTER_SUBNET%" --worker-subnet "%WORKER_SUBNET%" --apiserver-visibility Private --ingress-visibility Private --domain "%ARO_DOMAIN%" --outbound-type UserDefinedRouting --worker-vm-disk-size-gb 128 --worker-vm-size Standard_D16s_v5 --pull-secret "%PULL_SECRET_FILE%" --only-show-errors
+    if errorlevel 1 exit /b 1
 ) else (
-	echo INFO:the resource subnet for %worker-subnet% already exists! It's better to start from clean!
-    exit /b !errorlevel!
+    echo ARO cluster "%ARO_NAME%" already exists; no create operation was submitted.
 )
 
-REM Create the ARO instance
-rem echo az aro show --name %aro-instance-name% --resource-group %resource-group%
-call az aro show --name %aro-instance-name% --resource-group %resource-group% 2>null
-if !errorlevel! equ 3 (
-	echo az aro create --name %aro-instance-name% --resource-group %resource-group% --cluster-resource-group %cluster-resource-group% --vnet %vnet-name% --vnet-resource-group %vnet-resource-group% --master-subnet %master-subnet% --worker-subnet %worker-subnet% --apiserver-visibility Private --ingress-visibility Private --domain %domain-name% --outbound-type UserDefinedRouting --worker-vm-disk-size-gb 128 --worker-vm-size Standard_D16s_v5 --pull-secret @pull-secret.txt
-	call az aro create --name %aro-instance-name% --resource-group %resource-group% --cluster-resource-group %cluster-resource-group% --vnet %vnet-name% --vnet-resource-group %vnet-resource-group% --master-subnet %master-subnet% --worker-subnet %worker-subnet% --apiserver-visibility Private --ingress-visibility Private --domain %domain-name% --outbound-type UserDefinedRouting --worker-vm-disk-size-gb 128 --worker-vm-size Standard_D16s_v5 --pull-secret @pull-secret.txt
-	if !errorlevel! neq 0 (
-	    echo Error: Failed to create the ARO instance %aro-instance-name%. 
-        exit /b !errorlevel!
-	)
-) else if !errorlevel! equ 1 (
-    echo WARNING:the account does not have read permission! but we will try to create the resource.
-	echo az aro create --name %aro-instance-name% --resource-group %resource-group% --cluster-resource-group %cluster-resource-group% --vnet %vnet-name% --vnet-resource-group %vnet-resource-group% --master-subnet %master-subnet% --worker-subnet %worker-subnet% --apiserver-visibility Private --ingress-visibility Private --domain %domain-name% --outbound-type UserDefinedRouting --worker-vm-disk-size-gb 128 --worker-vm-size Standard_D16s_v5 --pull-secret @pull-secret.txt
-	call az aro create --name %aro-instance-name% --resource-group %resource-group% --cluster-resource-group %cluster-resource-group% --vnet %vnet-name% --vnet-resource-group %vnet-resource-group% --master-subnet %master-subnet% --worker-subnet %worker-subnet% --apiserver-visibility Private --ingress-visibility Private --domain %domain-name% --outbound-type UserDefinedRouting --worker-vm-disk-size-gb 128 --worker-vm-size Standard_D16s_v5 --pull-secret @pull-secret.txt
-	if !errorlevel! neq 0 (
-	    echo Error: Failed to create the ARO instance %aro-instance-name%. 
-        exit /b !errorlevel!
-	)    
-) else (
-	echo INFO:the resource ARO instance %aro-instance-name% already exists!
-    exit /b %errorlevel%
-)
-
-echo Resource provision completed successfully.
-
-
-
-rem echo az network vnet subnet show -g %vnet-resource-group% --vnet-name %vnet-name% --name %master-subnet%
-call az network vnet subnet show -g %vnet-resource-group% --vnet-name %vnet-name% --name %master-subnet% 2>null
-if %errorlevel% neq 0 (
-    echo Error: Failed to show the Subnet for %master-subnet%.
-    exit /b %errorlevel%
-)
-
-rem echo az network vnet subnet show -g %vnet-resource-group% --vnet-name %vnet-name% --name %worker-subnet%
-call az network vnet subnet show -g %vnet-resource-group% --vnet-name %vnet-name% --name %worker-subnet% 2>null
-if %errorlevel% neq 0 (
-    echo Error: Failed to show the Subnet for %worker-subnet%.
-    exit /b %errorlevel%
-)
-
-
-rem echo az group show --name %resource-group%
-call az group show --name %resource-group% 2>null
-if %errorlevel% neq 0 (
-    echo Error: Failed to show the resource group %resource-group%.
-    exit /b %errorlevel%
-)
-
-rem echo az aro show --name %aro-instance-name% --resource-group %resource-group%
-call az aro show --name %aro-instance-name% --resource-group %resource-group% 2>null
-if %errorlevel% neq 0 (
-	echo Error: Failed to show the resource ARO instance %aro-instance-name%
-    exit /b %errorlevel%
-)
-
-echo Resource verification completed successfully.
+call az aro show --name "%ARO_NAME%" --resource-group "%RESOURCE_GROUP%" --query "{name:name,state:provisioningState,api:apiserverProfile.url,console:consoleProfile.url}" -o jsonc --only-show-errors
+if errorlevel 1 exit /b 1
+echo Resource provisioning completed successfully.
 exit /b 0
-
