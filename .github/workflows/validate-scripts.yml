@@ -1,0 +1,225 @@
+name: Validate scripts
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inventory:
+    name: Check script coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Reject unvalidated script types
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import subprocess
+          import sys
+
+          supported_extensions = {
+              ".sh": "shell",
+              ".bash": "shell",
+              ".ps1": "powershell",
+              ".psm1": "powershell",
+              ".psd1": "powershell",
+              ".bat": "batch",
+              ".cmd": "batch",
+          }
+
+          modes = {}
+          staged = subprocess.check_output(["git", "ls-files", "--stage"], text=True)
+          for line in staged.splitlines():
+              metadata, path = line.split("\t", 1)
+              modes[path] = int(metadata.split()[0], 8)
+
+          unsupported = []
+          scripts = []
+          tracked = subprocess.check_output(["git", "ls-files", "-z"])
+          for raw_path in tracked.split(b"\0"):
+              if not raw_path:
+                  continue
+              path = raw_path.decode("utf-8")
+              suffix = pathlib.PurePosixPath(path).suffix.lower()
+              first_line = pathlib.Path(path).read_text(
+                  encoding="utf-8", errors="replace"
+              ).splitlines()[:1]
+              has_shebang = bool(first_line and first_line[0].startswith("#!"))
+              is_executable = bool(modes.get(path, 0) & 0o111)
+
+              if suffix not in supported_extensions and not has_shebang and not is_executable:
+                  continue
+
+              if suffix not in supported_extensions:
+                  unsupported.append(path)
+              else:
+                  scripts.append((path, supported_extensions[suffix]))
+
+          print("Validated script files:")
+          for path, kind in scripts:
+              print(f"  {kind}: {path}")
+
+          if unsupported:
+              print("\nUnvalidated script files detected:", file=sys.stderr)
+              for path in unsupported:
+                  print(f"  {path}", file=sys.stderr)
+              print(
+                  "Add a validator for each new script type before merging.",
+                  file=sys.stderr,
+              )
+              raise SystemExit(1)
+          PY
+
+  shell:
+    name: Validate shell scripts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check shell syntax
+        shell: bash
+        run: |
+          mapfile -d '' files < <(
+            git ls-files -z | grep -zE '\.(sh|bash)$' || true
+          )
+
+          if ((${#files[@]} == 0)); then
+            echo "No shell scripts found."
+            exit 0
+          fi
+
+          for file in "${files[@]}"; do
+            echo "Checking $file"
+            bash -n "$file"
+          done
+
+      - name: Run ShellCheck
+        shell: bash
+        run: |
+          mapfile -d '' files < <(
+            git ls-files -z | grep -zE '\.(sh|bash)$' || true
+          )
+
+          if ((${#files[@]} == 0)); then
+            echo "No shell scripts found."
+            exit 0
+          fi
+
+          shellcheck --severity=error "${files[@]}"
+
+  powershell:
+    name: Validate PowerShell scripts
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Parse PowerShell scripts
+        shell: pwsh
+        run: |
+          $files = @(git ls-files | Where-Object { $_ -match '\.(ps1|psm1|psd1)$' })
+          if ($files.Count -eq 0) {
+            Write-Output 'No PowerShell scripts found.'
+            exit 0
+          }
+
+          $failed = $false
+          foreach ($file in $files) {
+            Write-Output "Checking $file"
+            $tokens = $null
+            $errors = $null
+            $fullPath = (Get-Item -LiteralPath $file).FullName
+            [System.Management.Automation.Language.Parser]::ParseFile(
+              $fullPath,
+              [ref]$tokens,
+              [ref]$errors
+            ) | Out-Null
+
+            if ($null -ne $errors -and $errors.Count -gt 0) {
+              $failed = $true
+              foreach ($errorRecord in $errors) {
+                Write-Error "$file`: $($errorRecord.Message)"
+              }
+            }
+          }
+
+          if ($failed) {
+            exit 1
+          }
+
+  batch:
+    name: Validate batch scripts
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Run batch scripts in an isolated dry-run environment
+        shell: pwsh
+        run: |
+          $files = @(git ls-files | Where-Object { $_ -match '\.(bat|cmd)$' })
+          if ($files.Count -eq 0) {
+            Write-Output 'No batch scripts found.'
+            exit 0
+          }
+
+          $sandbox = Join-Path $env:RUNNER_TEMP 'batch-script-validation'
+          $stubDirectory = Join-Path $sandbox 'stubs'
+          New-Item -ItemType Directory -Force -Path $stubDirectory | Out-Null
+
+          # Keep Azure CLI calls inside the dry run from reaching a real subscription.
+          @('@echo off', 'exit /b 0') |
+            Set-Content -LiteralPath (Join-Path $stubDirectory 'az.cmd') -Encoding ascii
+
+          $env:Path = "$stubDirectory;$env:SystemRoot\System32"
+          $env:ARO_DEV_SUBSCRIPTION = 'ci-subscription'
+          $env:ARO_DEV_RESOURCE_GROUP = 'ci-resource-group'
+          $env:ARO_DEV_CLUSTER_RESOURCE_GROUP = 'ci-cluster-resource-group'
+          $env:ARO_DEV_VNET_RESOURCE_GROUP = 'ci-vnet-resource-group'
+          $env:ARO_DEV_VNET_NAME = 'ci-vnet'
+          $env:ARO_DEV_MASTER_SUBNET = 'ci-master-subnet'
+          $env:ARO_DEV_WORKER_SUBNET = 'ci-worker-subnet'
+          $env:ARO_DEV_CLUSTER_NAME = 'ci-cluster'
+          $env:ARO_DEV_DOMAIN = 'ci.example.com'
+          $env:ARO_DEV_MASTER_PREFIX = '10.0.0.0/24'
+          $env:ARO_DEV_WORKER_PREFIX = '10.0.1.0/24'
+          'test pull secret' | Set-Content -LiteralPath (Join-Path $sandbox 'pull-secret.txt') -Encoding ascii
+
+          foreach ($file in $files) {
+            $source = Join-Path $env:GITHUB_WORKSPACE $file
+            $target = Join-Path $sandbox (Split-Path -Leaf $file)
+            Copy-Item -LiteralPath $source -Destination $target -Force
+
+            if ((Split-Path -Leaf $file) -ieq 'createaro.bat') {
+              $arguments = 'dev pull-secret.txt'
+            } else {
+              $arguments = 'dev /YES'
+            }
+
+            Push-Location $sandbox
+            try {
+              $output = & "$env:SystemRoot\System32\cmd.exe" /d /c "call `"$target`" $arguments" 2>&1 | Out-String
+              $exitCode = $LASTEXITCODE
+            } finally {
+              Pop-Location
+            }
+
+            Write-Output "--- $file ---"
+            Write-Output $output
+
+            if ($output -match '(?im)(syntax of the command is incorrect|was unexpected at this time|cannot find the batch label specified)') {
+              throw "cmd.exe reported a syntax error in $file"
+            }
+            if ($exitCode -ne 0) {
+              throw "Batch dry run failed for $file with exit code $exitCode"
+            }
+          }
