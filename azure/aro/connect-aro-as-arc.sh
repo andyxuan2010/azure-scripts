@@ -1,91 +1,72 @@
-#!/bin/bash
-Connect the ARO Cluster as ARC Cluster :
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=aro-lib.sh
+source "$SCRIPT_DIR/aro-lib.sh"
 
-Connect the Cluster as ARC : https://learn.microsoft.com/en-us/azure/azure-arc/kubernetes/quickstart-connect-cluster?tabs=azure-cli%2Cazure-cloud#prerequisites
+usage() {
+    cat <<'USAGE'
+Usage: connect-aro-as-arc.sh --name CONNECTED_CLUSTER_NAME
+                              --resource-group RESOURCE_GROUP
+                              --location LOCATION
+                              [--workspace-resource-id RESOURCE_ID]
 
-Enabling : https://learn.microsoft.com/en-us/azure/azure-monitor/containers/container-insights-enable-arc-enabled-clusters?tabs=create-cli%2Cverify-portal%2Cmigrate-cli
+Connects the current OpenShift context to Azure Arc. Monitoring is installed
+only when --workspace-resource-id is supplied.
+USAGE
+}
 
-Disabling : https://learn.microsoft.com/en-us/azure/azure-monitor/containers/container-insights-enable-arc-enabled-clusters?tabs=create-cli%2Cverify-portal%2Cmigrate-cli#delete-extension-instance
+CLUSTER=${ARO_ARC_CLUSTER_NAME:-}
+RESOURCE_GROUP=${ARO_ARC_RESOURCE_GROUP:-}
+LOCATION=${ARO_ARC_LOCATION:-}
+WORKSPACE_ID=${ARO_LOG_ANALYTICS_WORKSPACE_ID:-}
 
-Continer Insights ConfigMap :
+while (($#)); do
+    case $1 in
+        --name|-n) CLUSTER=${2:?Missing value for --name}; shift 2 ;;
+        --resource-group|-g) RESOURCE_GROUP=${2:?Missing value for --resource-group}; shift 2 ;;
+        --location|-l) LOCATION=${2:?Missing value for --location}; shift 2 ;;
+        --workspace-resource-id) WORKSPACE_ID=${2:?Missing value for --workspace-resource-id}; shift 2 ;;
+        --help|-h) usage; exit 0 ;;
+        *) usage >&2; aro_die "Unknown argument: $1" ;;
+    esac
+done
 
-	wget https://raw.githubusercontent.com/microsoft/Docker-Provider/ci_prod/kubernetes/container-azm-ms-agentconfig.yaml
+[[ -n "$CLUSTER" && -n "$RESOURCE_GROUP" && -n "$LOCATION" ]] ||
+    { usage >&2; aro_die "Name, resource group, and location are required."; }
 
+trap 'rc=$?; aro_log ERROR "Command failed at line $LINENO (exit $rc)"; exit "$rc"' ERR
+aro_require_azure_login
+aro_require_oc_login
 
-Connect the Cluster as ARC Cluster :
+az extension add --name connectedk8s --upgrade --only-show-errors
+aro_az_provider_register Microsoft.Kubernetes Microsoft.KubernetesConfiguration Microsoft.ExtendedLocation
 
+if az connectedk8s show --name "$CLUSTER" --resource-group "$RESOURCE_GROUP" \
+    --only-show-errors -o none >/dev/null 2>&1; then
+    aro_log INFO "Azure Arc connected-cluster resource '$CLUSTER' already exists."
+else
+    aro_log INFO "Connecting the current OpenShift context to Azure Arc."
+    az connectedk8s connect --name "$CLUSTER" --resource-group "$RESOURCE_GROUP" \
+        --location "$LOCATION" --only-show-errors
+fi
 
-	az extension add --name connectedk8s
-	az extension update --name connectedk8s
+if [[ -n "$WORKSPACE_ID" ]]; then
+    az extension add --name k8s-extension --upgrade --only-show-errors
+    aro_log INFO "Enabling Azure Monitor for containers."
+    az k8s-extension create --name azuremonitor-containers \
+        --cluster-name "$CLUSTER" --resource-group "$RESOURCE_GROUP" \
+        --cluster-type connectedClusters --extension-type Microsoft.AzureMonitor.Containers \
+        --scope cluster --configuration-settings \
+        "logAnalyticsWorkspaceResourceID=$WORKSPACE_ID" \
+        "amalogs.useAADAuth=false" --only-show-errors
+    az k8s-extension show --name azuremonitor-containers \
+        --cluster-name "$CLUSTER" --resource-group "$RESOURCE_GROUP" \
+        --cluster-type connectedClusters --only-show-errors -o table
+fi
 
-
-	az provider register --namespace Microsoft.Kubernetes
-	az provider register --namespace Microsoft.KubernetesConfiguration
-	az provider register --namespace Microsoft.ExtendedLocation
-
-	az provider show -n Microsoft.Kubernetes -o table
-	az provider show -n Microsoft.KubernetesConfiguration -o table
-	az provider show -n Microsoft.ExtendedLocation -o table
-
-	az aro list -o table 
-
-	# 
-	# Login into the Cluster using oc cli or kubectl
-	#
-	
-	az group create --name AzureArcAROElevate --location uksouth --output table
-
-	az connectedk8s connect --name AzureArcAROElevate01 --resource-group AzureArcAROElevate --debug
-
-	az connectedk8s list -o table
-
-	helm list -A
-
-	oc get ns | grep -i arc
-
-	oc get all -n azure-arc
-	oc get all -n azure-arc-release
-
-
-
-List Log Analytics Workspace :
-
-
-	az resource list --resource-type Microsoft.OperationalInsights/workspaces -o json
-	az resource list --resource-type Microsoft.OperationalInsights/workspaces --query [].id
-
-
-
-
-
-Enable the monitoring extension on the connected ARC Cluster : ( Defult Log Analytics Workspace )
-
-
-	az k8s-extension create --name azuremonitor-containers --cluster-name AzureArcAROElevate01 --resource-group AzureArcAROElevate --cluster-type connectedClusters --extension-type Microsoft.AzureMonitor.Containers --configuration-settings amalogs.useAADAuth=false --debug
-
-
-
-Enable the monitoring extension on the connected ARC Cluster : ( Specific Log Analytics Workspace ) 
-# Added by :  Adam Sharif
-
-	az k8s-extension create --name azuremonitor-containers --cluster-name AzureArcAROElevate01 --resource-group AzureArcAROElevate --cluster-type connectedClusters --extension-type Microsoft.AzureMonitor.Containers --configuration-settings logAnalyticsWorkspaceResourceID=<armResourceIdOfExistingWorkspace> --configuration-settings amalogs.useAADAuth=false --debug
-
-
-
-
-Show the Extension is installed :
-
-
-	az k8s-extension show --name azuremonitor-containers --cluster-name AzureArcAROElevate01 --resource-group AzureArcAROElevate --cluster-type connectedClusters -n azuremonitor-containers
-
-Get AMA Pods :
-
-    oc get pods -n kube-system -l dsName=ama-logs-ds
-
-
-List Helm Charts :
-
-	helm list -A 
-
-
+aro_log INFO "Azure Arc connection completed."
+az connectedk8s show --name "$CLUSTER" --resource-group "$RESOURCE_GROUP" \
+    --only-show-errors -o table

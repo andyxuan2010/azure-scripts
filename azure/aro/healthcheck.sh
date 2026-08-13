@@ -1,205 +1,193 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
 
-# export PATH=/usr/local/bin:/usr/bin:/usr/local/sbin:/usr/sbin
-# export OCP_USERNAME=kubeadmin
-# export OCP_URL=https://api.example.com:6443
-# export SERVER_ARGUMENTS="--server=${OCP_URL}"
-# export LOGIN_ARGUMENTS="--username=${OCP_USERNAME} --password=${OCP_PASSWORD}"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=aro-lib.sh
+source "$SCRIPT_DIR/aro-lib.sh"
 
-# export PROJECT_CPD_INST_OPERANDS="cpd-operands"
-# export PROJECT_CPD_INST_OPERATORS="cpd-operators"
-# export PROJECT_OADP_OPERATOR="oadp-operator"
+usage() {
+    cat <<'USAGE'
+Usage: healthcheck.sh [--attempts COUNT] [--retry-delay SECONDS]
 
-# export SMTP=smtp.example.com
-export MAIL_ID_LIST="user@example.com"
-# export MAIL_ID_LIST="user@example.com"
-# export CURRENT_DATE=$(date +"%Y%m%d%H%M")
-# export LOG_FILE="/tmp/healthcheck_log_$(date +%Y%m%d%H%M%S).txt"
-export LOG_FILE="/tmp/healthcheck_log_$(date +%Y%m%d%H%M%S).txt"
-# export CPD_CLI_DIR=/tmp/cp4d-install/cpd-cli-linux-EE-13.1.0-79
-# export OC_PATH=/tmp/cp4d-install
+Required environment:
+  PROJECT_CPD_INST_OPERANDS
+  CPD_CLI_DIR, unless CPD_CLI is set
 
-cluster_login() {
-    log_message "Trying to login to OCP." "INFO"
-    oc_login=$(oc login ${OCP_URL} ${LOGIN_ARGUMENTS})
-    local failed_login="Login failed"
-    if [[ $oc_login =~ $failed_login ]]; then
-        log_message "$oc_login" "ERROR"
-        log_message "Failed to login to OCP. Exiting..." "ERROR"
-        send_mail_notification "Backup failed: Failed to login to OCP."
-        exit 1
-    else
-        log_message "$oc_login" "INFO"
-        log_message "Successfully logged on to OCP." "INFO"
-    fi
-
-    log_message "Trying to login to cpd-cli." "INFO"
-    cpd_cli_login=$(${CPD_CLI_DIR}/cpd-cli manage login-to-ocp ${SERVER_ARGUMENTS} ${LOGIN_ARGUMENTS})
-    if [[ $cpd_cli_login =~ $failed_login ]]; then
-        log_message "$cpd_cli_login" "ERROR"
-        log_message "Failed to login to cpd-cli. Exiting..." "ERROR"
-        send_mail_notification "Backup failed: Failed to login to cpd-cli."
-        exit 1
-    else
-        log_message "$cpd_cli_login" "INFO"
-        log_message "Successfully logged on to cpd-cli." "INFO"
-    fi
-
+Authentication must already exist in the current oc context, or use
+OCP_URL with OCP_TOKEN or OCP_USERNAME/OCP_PASSWORD. Notification is
+disabled unless NOTIFY_EMAILS and SMTP_SERVER are supplied.
+USAGE
 }
 
-log_message() {
-    local log_message="$1"
-    local log_level="$2"
+MAX_ATTEMPTS=${HEALTHCHECK_ATTEMPTS:-5}
+RETRY_DELAY=${HEALTHCHECK_RETRY_DELAY:-120}
+OC_BIN=${OC_BIN:-oc}
+CPD_CLI=${CPD_CLI:-}
+PROJECT_CPD_INST_OPERANDS=${PROJECT_CPD_INST_OPERANDS:-}
+PROJECT_CPD_INST_OPERATORS=${PROJECT_CPD_INST_OPERATORS:-}
+EDB_CLUSTER_NAME=${EDB_CLUSTER_NAME:-zen-metastore-edb}
+LOG_DIR=${LOG_DIR:-/tmp/aro-healthcheck}
+LOG_FILE=${LOG_FILE:-}
+OCP_URL=${OCP_URL:-}
+OCP_TOKEN=${OCP_TOKEN:-}
+OCP_USERNAME=${OCP_USERNAME:-}
+OCP_PASSWORD=${OCP_PASSWORD:-}
+NOTIFY_EMAILS=${NOTIFY_EMAILS:-}
+SMTP_SERVER=${SMTP_SERVER:-}
 
-    echo "$(date) ${log_level}: ${log_message}"
-    #sleep 1
+while (($#)); do
+    case $1 in
+        --attempts) MAX_ATTEMPTS=${2:?Missing value for --attempts}; shift 2 ;;
+        --retry-delay) RETRY_DELAY=${2:?Missing value for --retry-delay}; shift 2 ;;
+        --help|-h) usage; exit 0 ;;
+        *) usage >&2; aro_die "Unknown argument: $1" ;;
+    esac
+done
+
+[[ "$MAX_ATTEMPTS" =~ ^[1-9][0-9]*$ && "$RETRY_DELAY" =~ ^[0-9]+$ ]] ||
+    aro_die "Attempts and retry delay must be non-negative integers."
+[[ -n "$PROJECT_CPD_INST_OPERANDS" ]] ||
+    { usage >&2; aro_die "PROJECT_CPD_INST_OPERANDS is required."; }
+if [[ -z "$CPD_CLI" ]]; then
+    [[ -n "${CPD_CLI_DIR:-}" ]] ||
+        { usage >&2; aro_die "Set CPD_CLI or CPD_CLI_DIR."; }
+    CPD_CLI="$CPD_CLI_DIR/cpd-cli"
+fi
+
+aro_require_cmd "$OC_BIN"
+aro_require_cmd jq
+aro_require_cmd awk
+aro_require_file "$CPD_CLI"
+mkdir -p "$LOG_DIR"
+[[ -n "$LOG_FILE" ]] || LOG_FILE="$LOG_DIR/healthcheck_$(date -u +%Y%m%dT%H%M%SZ).log"
+touch "$LOG_FILE"
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+trap 'rc=$?; aro_log ERROR "Health check failed at line $LINENO (exit $rc)"; exit "$rc"' ERR
+
+log_message() {
+    aro_log "$2" "$1"
 }
 
 send_mail_notification() {
-    /usr/bin/tar -czf "${LOG_FILE}.tar.gz" "${LOG_FILE}"
-    cat "${LOG_FILE}" | mailx -v -S smtp=smtp.example.com -s "$1" -r "no-reply-nonprod-cpdadmin@example.com" -a "${LOG_FILE}.tar.gz" $MAIL_ID_LIST
+    local subject=$1
+    [[ -n "$NOTIFY_EMAILS" && -n "$SMTP_SERVER" ]] || return 0
+    aro_require_cmd mailx
+    aro_require_cmd tar
+    local archive="$LOG_FILE.tar.gz"
+    local -a recipients
+    read -r -a recipients <<< "$NOTIFY_EMAILS"
+    tar -czf "$archive" -C "$(dirname -- "$LOG_FILE")" "$(basename -- "$LOG_FILE")"
+    mailx -S "smtp=$SMTP_SERVER" -s "$subject" -a "$archive" "${recipients[@]}" < "$LOG_FILE" || \
+        log_message "Email notification failed." WARNING
+}
+
+cluster_login() {
+    log_message "Validating OpenShift authentication." INFO
+    if [[ -n "$OCP_TOKEN" ]]; then
+        [[ -n "$OCP_URL" ]] || aro_die "OCP_URL is required with OCP_TOKEN."
+        "$OC_BIN" login --server "$OCP_URL" --token "$OCP_TOKEN" >/dev/null
+    elif [[ -n "$OCP_USERNAME" || -n "$OCP_PASSWORD" ]]; then
+        [[ -n "$OCP_URL" && -n "$OCP_USERNAME" && -n "$OCP_PASSWORD" ]] ||
+            aro_die "OCP_URL, OCP_USERNAME, and OCP_PASSWORD must be provided together."
+        "$OC_BIN" login --server "$OCP_URL" --username "$OCP_USERNAME" \
+            --password "$OCP_PASSWORD" >/dev/null
+    else
+        "$OC_BIN" whoami >/dev/null
+    fi
+    log_message "OpenShift authentication is valid for $("$OC_BIN" whoami)." INFO
 }
 
 get_cr_status() {
-    #	${CPD_CLI_DIR}/cpd-cli manage get-cr-status --cpd_instance_ns=${PROJECT_CPD_INST_OPERANDS}
-    all_completed=true
-    ${CPD_CLI_DIR}/cpd-cli manage get-cr-status --cpd_instance_ns=${PROJECT_CPD_INST_OPERANDS} | sed -n '/\[INFO\] Output the result in the JSON format:/,/^\[/{:a;n;p;ba}' | sed '2!d' >/tmp/output.json
-    jq -r '.[] | .[] | "\(.["CR-name"]) \(.Status)"' /tmp/output.json | while read -r line; do
+    local raw_json
+    local raw_output
+    local failed=0
+    local seen=0
+    raw_output="$(mktemp)"
+    raw_json="$(mktemp)"
+    trap 'rm -f -- "$raw_output" "$raw_json"' RETURN
 
-        # Extract the CR-name and Status from the line
-        CR_NAME=$(echo "$line" | cut -d ' ' -f1)
-        STATUS=$(echo "$line" | cut -d ' ' -f2-)
-        # Check if the status is not Completed
-        if [[ ! "$STATUS" == "Completed" && ! "$STATUS" == "Succeeded" ]]; then
-            log_message "$CR_NAME  is not completed, current status: $STATUS" "INFO"
-            all_completed=false
-        else
-            log_message "$CR_NAME  is  completed, current status: $STATUS" "INFO"
-
-        fi
-    done
-
-    # Check the overall status after going through all components
-    if [ "$all_completed" = true ]; then
-        log_message "All components are in Completed state." "INFO"
-        return 0
-    else
-        log_message "Some components are not in Completed state." "WARNING"
+    if ! "$CPD_CLI" manage get-cr-status \
+        --cpd_instance_ns="$PROJECT_CPD_INST_OPERANDS" > "$raw_output" 2>&1; then
+        log_message "cpd-cli get-cr-status failed: $(tail -n 10 "$raw_output")" ERROR
         return 1
     fi
+    awk '
+        /Output the result in the JSON format:/ { capture=1; next }
+        capture && /^\[/ { exit }
+        capture { print }
+    ' "$raw_output" > "$raw_json"
+    jq -e . "$raw_json" >/dev/null ||
+        { log_message "cpd-cli did not return valid CR status JSON." ERROR; return 1; }
+
+    while IFS=$'\t' read -r cr_name status; do
+        [[ -n "$cr_name" ]] || continue
+        seen=$((seen + 1))
+        if [[ "$status" == "Completed" || "$status" == "Succeeded" ]]; then
+            log_message "$cr_name is complete: $status" INFO
+        else
+            log_message "$cr_name is not complete: $status" ERROR
+            failed=1
+        fi
+    done < <(jq -r '.[] | .[] | [."CR-name", (.Status // "")] | @tsv' "$raw_json")
+
+    ((seen > 0)) || { log_message "No CR statuses were returned." ERROR; return 1; }
+    return "$failed"
 }
 
 get_pod_status() {
-
-    output=$(oc get pod -A -o wide --no-headers | grep -Ev '([[:digit:]])/\1.*R' | grep -Ev 'Completed|env-spec-sync-job')
-    if [ -z "$output" ]; then
-        log_message "All pods are running fine." "INFO"
+    local output
+    output="$("$OC_BIN" get pods --all-namespaces --no-headers | awk '
+        $2 !~ /env-spec-sync-job/ {
+            split($3, ready, "/")
+            if ($4 !~ /^(Running|Completed|Succeeded)$/ || ready[1] != ready[2]) print
+        }
+    ')"
+    if [[ -z "$output" ]]; then
+        log_message "All pods are ready or completed." INFO
         return 0
-    else
-        log_message "$output" "ERROR"
-        return 1
     fi
-}
-
-get_cluster_status() {
-    # Check status of the installed components
-    get_cr_status
-    CR_STATUS=$?
-    if [ $CR_STATUS -eq 0 ]; then
-        log_message "All CS status is fine." "INFO"
-    else
-        log_message "All CS status is ERROR." "ERROR"
-        return 1
-    fi
-
-    get_pod_status
-    POD_STATUS=$?
-    if [ $POD_STATUS -eq 0 ]; then
-        log_message "Cluster health is good. Proceeding with backup" "INFO"
-        return 0
-    else
-        log_message "Cluster health doesn't look good. Verify before proceeding" "ERROR"
-        return 1
-    fi
-
+    log_message "Non-ready pods detected:\n$output" ERROR
+    return 1
 }
 
 zen_metastore_edb_status() {
-    log_message "Checking zen-metastore-edb cluster state" "INFO"
-    cluster_status=$(oc cnp status zen-metastore-edb -n ${PROJECT_CPD_INST_OPERANDS} --verbose)
-
-    if [[ "$cluster_status" == *"Cluster in healthy state"* ]]; then
-        log_message "Cluster zen-metastore-edb is healthy" "INFO"
-        primary_pod=$(oc cnp status zen-metastore-edb -n ${PROJECT_CPD_INST_OPERANDS} | tail -n 2 | awk '{print $1}' | head -1)
-        secondary_pod=$(oc cnp status zen-metastore-edb -n ${PROJECT_CPD_INST_OPERANDS} | tail -n 2 | awk '{print $1}' | tail -1)
-        log_message "Primary pod: $primary_pod" "INFO"
-        log_message "Secondary pod: $secondary_pod" "INFO"
-    else
-        log_message "Cluster zen-metastore-edb is unhealthy. Exiting..." "ERROR"
-        #        send_mail_notification "Backup Failed: zen-metastore-edb is unhealthy."
-        exit 1
+    log_message "Checking $EDB_CLUSTER_NAME cluster state." INFO
+    local status
+    status="$("$OC_BIN" cnp status "$EDB_CLUSTER_NAME" \
+        --namespace "$PROJECT_CPD_INST_OPERANDS" --verbose)"
+    if [[ "$status" == *"Cluster in healthy state"* ]]; then
+        log_message "$EDB_CLUSTER_NAME is healthy." INFO
+        return 0
     fi
+    log_message "$EDB_CLUSTER_NAME is unhealthy." ERROR
+    return 1
 }
 
-########################################################
-###  start to main
-########################################################
+check_once() {
+    get_cr_status && get_pod_status && zen_metastore_edb_status
+}
 
-# Redirect stdout and stderr to log file
-exec >"${LOG_FILE}" 2>&1
-log_message "Starting CPD Health check Execution $(date)" "INFO"
+main() {
+    log_message "Starting ARO CPD health check." INFO
+    cluster_login
 
-# Login to cluster
-cluster_login
-#Check cluster health before doing backup
-# Initialize loop counter
-COUNTER=0
-# Maximum number of attempts
-MAX_ATTEMPTS=5
-# Time to wait before retrying (in seconds)
-WAIT_TIME=120
+    local attempt
+    for ((attempt=1; attempt<=MAX_ATTEMPTS; attempt++)); do
+        if check_once; then
+            log_message "Health check succeeded on attempt $attempt." INFO
+            return 0
+        fi
+        log_message "Health check failed on attempt $attempt of $MAX_ATTEMPTS." WARNING
+        if ((attempt < MAX_ATTEMPTS)); then
+            sleep "$RETRY_DELAY"
+        fi
+    done
 
-while [ $COUNTER -lt $MAX_ATTEMPTS ]; do
-    get_cluster_status
-    CLUSTER_STATUS=$?
-    # Check the exit status of the command
-    if [ $CLUSTER_STATUS -eq 0 ]; then
-        echo "Command succeeded on attempt $((COUNTER + 1))"
-        break
-    else
-        echo "Command failed on attempt $((COUNTER + 1))"
-        sleep $WAIT_TIME
-        COUNTER=$((COUNTER + 1))
-    fi
-done
+    send_mail_notification "ARO health check failed"
+    return 1
+}
 
-if [ $CLUSTER_STATUS -ne 0 ]; then
-    echo "Command failed on attempt $((COUNTER + 1))"
-    send_mail_notification "CLUSTER HEALTH CHECK: cluster/pod is UNHEALTHY."
-    exit 1
-fi
-
-COUNTER=0
-
-while [ $COUNTER -lt $MAX_ATTEMPTS ]; do
-    # Check zen_metastore_edb pods are in sync
-    zen_metastore_edb_status
-    EDB_STATUS=$?
-    # Check the exit status of the command
-    if [ $EDB_STATUS -eq 0 ]; then
-        echo "Command succeeded on attempt $((COUNTER + 1))"
-        break
-    else
-        echo "Command failed on attempt $((COUNTER + 1))"
-        sleep $WAIT_TIME
-        COUNTER=$((COUNTER + 1))
-    fi
-done
-if [ $EDB_STATUS -ne 0 ]; then
-    echo "Command failed on attempt $((COUNTER + 1))"
-    send_mail_notification "EDB HEALTH CHECK: zen-metastore-edb is UNHEALTHY."
-    exit 1
-fi
-
-
-log_message "CPD Offline Health check Execution Completed $(date)" "INFO"
+main "$@"

@@ -1,43 +1,51 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=aro-lib.sh
+source "$SCRIPT_DIR/aro-lib.sh"
 
-################################################################################################## Initialize
+usage() {
+    cat <<'USAGE'
+Usage: aro4-getcreds.sh --name CLUSTER --resource-group RESOURCE_GROUP
+                         [--show-credentials]
 
-echo " "
-echo "Display ARO Credentials & Endpoints"
-echo "==================================="
-echo " "
+Endpoint metadata is shown by default. Credentials are retrieved only when
+--show-credentials is explicitly supplied and are never embedded in a command.
+USAGE
+}
 
-if [ $# -ne 1 ]; then
-    echo "Usage: $BASH_SOURCE <name of cluster>"
-    exit 1
+CLUSTER=${ARO_CLUSTER_NAME:-}
+RESOURCE_GROUP=${ARO_RESOURCE_GROUP:-}
+SHOW_CREDENTIALS=0
+while (($#)); do
+    case $1 in
+        --name|-n) CLUSTER=${2:?Missing value for --name}; shift 2 ;;
+        --resource-group|-g) RESOURCE_GROUP=${2:?Missing value for --resource-group}; shift 2 ;;
+        --show-credentials) SHOW_CREDENTIALS=1; shift ;;
+        --help|-h) usage; exit 0 ;;
+        *) usage >&2; aro_die "Unknown argument: $1" ;;
+    esac
+done
+
+[[ -n "$CLUSTER" && -n "$RESOURCE_GROUP" ]] ||
+    { usage >&2; aro_die "Both --name and --resource-group are required."; }
+
+trap 'rc=$?; aro_log ERROR "Command failed at line $LINENO (exit $rc)"; exit "$rc"' ERR
+aro_require_azure_login
+aro_aro_exists "$CLUSTER" "$RESOURCE_GROUP" ||
+    aro_die "ARO cluster '$CLUSTER' was not found in resource group '$RESOURCE_GROUP'."
+
+aro_log INFO "ARO endpoint metadata for '$CLUSTER':"
+az aro show --name "$CLUSTER" --resource-group "$RESOURCE_GROUP" \
+    --query '{apiServer:apiserverProfile.url,console:consoleProfile.url,ingress:ingressProfiles}' \
+    -o jsonc --only-show-errors
+
+if ((SHOW_CREDENTIALS)); then
+    aro_log WARNING "Displaying kubeadmin credentials in the terminal was explicitly requested."
+    az aro list-credentials --name "$CLUSTER" --resource-group "$RESOURCE_GROUP" \
+        -o table --only-show-errors
+else
+    aro_log INFO "Credentials were not displayed. Use --show-credentials only in a controlled terminal."
 fi
-
-if [ -z "$(az aro list -o table |grep -i  $1)" ]; then
-    echo "$1 doesn't seem to exist. Review the output of 'az aro list'"
-    exit 1
-fi
-
-clusterName="$(az aro list -o table |grep -i $1 | awk '{print $1}')"
-clusterResourceGroup="$(az aro list -o table |grep -i $1 | awk '{print $2}')"
-
-echo "Cluster name: $clusterName"
-echo " "
-
-az aro show -n $clusterName -g $clusterResourceGroup -o jsonc --query '[apiserverProfile , consoleProfile , ingressProfiles]'
-
-echo " "
-
-az aro list-credentials -o table -n $clusterName -g $clusterResourceGroup
-
-declare apiServer="$(az aro show -n $clusterName -g $clusterResourceGroup -o tsv --query '[apiserverProfile.url]')"
-declare kubePW="$(az aro list-credentials -n $clusterName -g $clusterResourceGroup -o tsv --query '[kubeadminPassword]')"
-
-echo " "
-echo "To log in to CLI:"
-echo "oc login $apiServer -u kubeadmin -p $kubePW"
-
-echo " "
-echo "To delete cluster:"
-echo "az aro delete -n $clusterName -g $clusterResourceGroup -y ; az group delete -n $clusterResourceGroup -y"
-echo " "

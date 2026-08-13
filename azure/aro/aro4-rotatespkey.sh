@@ -1,111 +1,85 @@
-#!/bin/bash
+#!/usr/bin/env bash
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=aro-lib.sh
+source "$SCRIPT_DIR/aro-lib.sh"
 
-################################################################################################## 
+usage() {
+    cat <<'USAGE'
+Usage: aro4-rotatespkey.sh --name CLUSTER --resource-group RESOURCE_GROUP
+                           [--valid-years YEARS] [--yes] [--dry-run]
 
-echo " "
-echo "Rotate Azure Red Hat OpenShift Service Principal Credentials"
-echo "============================================================"
+Appends a new service-principal credential, updates ARO to use it, and leaves
+existing credentials in place. The generated secret is never printed.
+USAGE
+}
 
-if [ $# -ne 1 ]; then
-    echo "Usage: $BASH_SOURCE <name of cluster>"
+CLUSTER=${ARO_CLUSTER_NAME:-}
+RESOURCE_GROUP=${ARO_RESOURCE_GROUP:-}
+VALID_YEARS=${ARO_SP_VALID_YEARS:-2}
+DRY_RUN=0
+export ARO_ASSUME_YES=0
+
+while (($#)); do
+    case $1 in
+        --name|-n) CLUSTER=${2:?Missing value for --name}; shift 2 ;;
+        --resource-group|-g) RESOURCE_GROUP=${2:?Missing value for --resource-group}; shift 2 ;;
+        --valid-years) VALID_YEARS=${2:?Missing value for --valid-years}; shift 2 ;;
+        --yes) ARO_ASSUME_YES=1; shift ;;
+        --dry-run) DRY_RUN=1; shift ;;
+        --help|-h) usage; exit 0 ;;
+        *) usage >&2; aro_die "Unknown argument: $1" ;;
+    esac
+done
+
+[[ -n "$CLUSTER" && -n "$RESOURCE_GROUP" ]] ||
+    { usage >&2; aro_die "Both --name and --resource-group are required."; }
+[[ "$VALID_YEARS" =~ ^[1-9][0-9]*$ && "$VALID_YEARS" -le 250 ]] ||
+    aro_die "--valid-years must be an integer from 1 through 250."
+
+trap 'rc=$?; aro_log ERROR "Command failed at line $LINENO (exit $rc)"; exit "$rc"' ERR
+aro_require_azure_login
+aro_aro_exists "$CLUSTER" "$RESOURCE_GROUP" ||
+    aro_die "ARO cluster '$CLUSTER' was not found in resource group '$RESOURCE_GROUP'."
+
+SP_APP_ID="$(az aro show --name "$CLUSTER" --resource-group "$RESOURCE_GROUP" \
+    --query servicePrincipalProfile.clientId -o tsv --only-show-errors)"
+[[ -n "$SP_APP_ID" ]] || aro_die "The ARO service-principal client ID could not be read."
+
+EXPIRING="$(az ad sp credential list --id "$SP_APP_ID" \
+    --query '[].endDate' -o tsv --only-show-errors || true)"
+aro_log INFO "Service-principal client ID: $SP_APP_ID"
+aro_log INFO "Existing credential expiry values: ${EXPIRING:-none reported}"
+
+if ((DRY_RUN)); then
+    aro_log INFO "Dry run complete. No credential or ARO changes were made."
+    exit 0
+fi
+
+aro_confirm "Append a new ARO service-principal credential for '$CLUSTER'?" "ROTATE $CLUSTER"
+aro_require_cmd jq
+aro_require_cmd date
+
+END_DATE="$(date -u -d "+$VALID_YEARS years" '+%Y-%m-%dT%H:%M:%SZ')"
+DESCRIPTION="aro-rotation-$(date -u '+%Y%m%dT%H%M%SZ')"
+
+aro_log INFO "Appending a new service-principal credential expiring at $END_DATE."
+NEW_CREDENTIAL_JSON="$(az ad sp credential reset --id "$SP_APP_ID" --append \
+    --end-date "$END_DATE" --display-name "$DESCRIPTION" -o json --only-show-errors)"
+NEW_KEY_ID="$(jq -r '.keyId // empty' <<< "$NEW_CREDENTIAL_JSON")"
+NEW_SECRET="$(jq -r '.password // empty' <<< "$NEW_CREDENTIAL_JSON")"
+[[ -n "$NEW_KEY_ID" ]] || aro_die "Azure did not return the new credential key ID."
+[[ -n "$NEW_SECRET" ]] || aro_die "Azure did not return the new credential secret."
+
+if ! az aro update --name "$CLUSTER" --resource-group "$RESOURCE_GROUP" \
+    --client-id "$SP_APP_ID" --client-secret "$NEW_SECRET" \
+    --only-show-errors -o none; then
+    aro_log ERROR "ARO update failed. The new credential remains appended; do not revoke it until ARO is updated."
     exit 1
 fi
 
-if [ -z "$(az aro list -o table --only-show-errors |grep -i  $1)" ]; then
-    echo "$1 doesn't seem to exist. Review the output of 'az aro list'"
-    exit 1
-fi
-
-clusterName="$(az aro list -o table --only-show-errors |grep -i $1 | awk '{print $1}')"
-clusterResourceGroup="$(az aro list -o table --only-show-errors |grep -i $1 | awk '{print $2}')"
-
-echo " "
-echo "Cluster name: $clusterName"
-echo " "
-
-echo -n "Obtaining Azure Service Principal AppID for existing cluster..."
-SPAPPID="$(az aro show -n $clusterName -g $clusterResourceGroup --only-show-errors --query servicePrincipalProfile.clientId -o tsv)"
-echo "Done."
-echo -n "Obtaining Azure Service Principal Secret for texisting cluster..."
-SPSECRET="$(oc get secret azure-credentials -n kube-system -o json | jq -r .data.azure_client_secret | base64 --decode)"
-echo "Done."
-echo -n "Obtaining Azure Service Principal credential create/expiry information..."
-CREATED="$(az ad sp credential list --id $SPAPPID --only-show-errors --query '[].startDate' -o tsv)"
-EXPIRING="$(az ad sp credential list --id $SPAPPID --only-show-errors --query '[].endDate' -o tsv)"
-echo "Done."
-
-echo " "
-echo "Based on your current Azure Red Hat OpenShift Application ID, $SPAPPID, the dates for your current credential are as follows:"
-echo " "
-echo "*   Create date: $CREATED"
-echo "*   Expiration date: $EXPIRING"
-echo " "
-echo "Shall I continue?"
-PS3="Select a numbered option >> "
-options=("Yes" "No")
-select yn in "${options[@]}"
-do
-case $yn in
-    Yes ) break ;;
-    No ) echo "Well okay, then."; exit ;;
-esac
-done
-
-echo " "
-while [[ "$valid" -lt 1 || "$valid" -gt 250 ]]
-do
-
-  echo -n "How many years would you like the service principal key to be valid for from today's date (1-250) >> "
-  read valid
-
-done
-
-echo " "
-echo "Your current Azure Red Hat OpenShift Service Principal secret is:  $SPSECRET"
-echo "Would you like to remove the current secret and generate a new one?"
-PS3="Select a numbered option >> "
-options=("Yes" "No")
-select yn in "${options[@]}"
-do
-case $yn in
-	Yes ) 
-		echo -n "Generating new Azure Service Principal Secret..."
-		SPSECRET="$(cat /proc/sys/kernel/random/uuid | tr -d '\n\r')"
-		echo "Done."
-		break ;;
-	No )
-		echo "Current Azure Service Principal Secret will be used..."
-		break ;;
-esac
-done
-
-expiry="$(date -d "+$valid years" +%Y-%m-%d)"
-echo " "
-
-echo "***************************************************"
-echo "* The new key expiration date will be: $expiry *"
-echo "* Sleeping for 10 seconds. CTL-C to abort.        *"
-echo "***************************************************"
-sleep 10
-
-echo " "
-echo -n "Obtaining Azure Service Principal KeyID..."
-SPSECRETKEYID="$(az ad sp credential list --id $SPAPPID -o tsv --only-show-errors | awk '{print $4}')"
-echo "Done."
-echo -n "Setting secret $SPSECRET and expiration date $expiry into existing Azure Service Principal..."
-az ad sp credential reset -n $SPAPPID --credential-description "$(date +%m%d%Y%H%M%S)" --end-date "$expiry" -p $SPSECRET --only-show-errors > /dev/null 2>&1
-echo "Done."
-echo "Calling the Azure Linux CLI to push the changes into Azure Red Hat OpenShift"
-az aro update -n $clusterName -g $clusterResourceGroup --client-id $SPAPPID --client-secret $SPSECRET --only-show-errors
-
-echo " "
-echo "Please remember that if you are using the same service principal to connect to Azure Active Directory you will need to"
-echo "update the OpenShift secret for the AAD OAuth connector which is typically 'openid-client-secret-azuread' per Microsoft"
-echo "documentation. Given that every use case is different (using the same SP vs an SP specific for AAD connectivity)"
-echo "this script will not address the patching of AAD secrets."
-echo " "
-echo "Done."
-echo " "
-
-exit 0
+aro_log INFO "ARO now uses the new service-principal credential (key ID $NEW_KEY_ID)."
+aro_log WARNING "Revoke the old credential only after monitoring confirms the cluster is healthy."
